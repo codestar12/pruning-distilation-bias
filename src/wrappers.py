@@ -42,10 +42,14 @@ class Teacher(torch.nn.Module):
         self.activation = []
         self.sethooks()
 
-    def forward(self, x):
+    def forward(self, x, is_feat=False):
         self.activation = []
         y_ = self.model(x)
-        return self.activation, y_
+
+        if is_feat:
+            return self.activation, y_
+        else:
+            return y_
 
     def get_activation(self, name, i):
         def hook(model, input, output):

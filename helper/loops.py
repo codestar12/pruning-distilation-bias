@@ -28,9 +28,10 @@ def train_vanilla(epoch, train_loader, model, criterion, optimizer, opt):
 
         # ===================forward=====================
         output = model(input)
+        
         loss = criterion(output, target)
-
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        
         losses.update(loss.item(), input.size(0))
         top1.update(acc1[0], input.size(0))
         top5.update(acc5[0], input.size(0))
@@ -111,9 +112,15 @@ def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, o
         preact = False
         if opt.distill in ['abound']:
             preact = True
-        feat_s, logit_s = model_s(input, is_feat=True, preact=preact)
+        if 'pretrained_torch' not in opt.path_t:
+            feat_s, logit_s = model_s(input, is_feat=True, preact=preact)
+        else:
+            feat_s, logit_s = model_s(input, is_feat=True)
         with torch.no_grad():
-            feat_t, logit_t = model_t(input, is_feat=True, preact=preact)
+            if 'pretrained_torch' not in opt.path_t:
+                feat_t, logit_t = model_t(input, is_feat=True, preact=preact)
+            else:
+                feat_t, logit_t = model_t(input, is_feat=True)
             feat_t = [f.detach() for f in feat_t]
 
         # cls + kl div
@@ -242,7 +249,7 @@ def validate(val_loader, model, criterion, opt):
             # compute output
             output = model(input)
             loss = criterion(output, target)
-
+            
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
             losses.update(loss.item(), input.size(0))

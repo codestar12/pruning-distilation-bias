@@ -21,7 +21,7 @@ def get_data_folder():
     elif hostname.startswith('yonglong-home'):
         data_folder = '/home/yonglong/Data/data/imagenet'
     else:
-        data_folder = './data/imagenet'
+        data_folder = './data/imagenet2012'
 
     if not os.path.isdir(data_folder):
         os.makedirs(data_folder)

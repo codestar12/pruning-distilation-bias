@@ -3,6 +3,7 @@ the general training framework
 """
 
 from __future__ import print_function
+from models.resnet import resnet20
 
 import os
 os.environ['KMP_WARNINGS'] = 'off'
@@ -15,6 +16,7 @@ import torch
 import torch.optim as optim
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
+import torchvision.models as models
 
 
 from models import model_dict
@@ -22,6 +24,7 @@ from models.util import Embed, ConvReg, LinearEmbed
 from models.util import Connector, Translator, Paraphraser
 
 from dataset.cifar100 import get_cifar100_dataloaders, get_cifar100_dataloaders_sample, get_cifar100_imbalanced
+from dataset.imagenet import get_imagenet_dataloader
 
 from helper.util import adjust_learning_rate
 
@@ -37,12 +40,15 @@ import torch.nn.utils.prune as prune
 from src.prune_scheduler import AgpPruningRate
 from itertools import chain
 import numpy as np
+from src.wrappers import Student, Teacher
 
 def parse_option():
 
     hostname = socket.gethostname()
 
     parser = argparse.ArgumentParser('argument for training')
+
+    parser.add_argument('--gpu', type=str, default='0', choices=['0', '1', '2', '3'], help='gpu to train on')
 
     parser.add_argument('--print_freq', type=int, default=100, help='print frequency')
     parser.add_argument('--tb_freq', type=int, default=500, help='tb frequency')
@@ -53,14 +59,14 @@ def parse_option():
     parser.add_argument('--init_epochs', type=int, default=30, help='init training for two-stage methods')
 
     # optimization
-    parser.add_argument('--learning_rate', type=float, default=0.05, help='learning rate')
+    parser.add_argument('--learning_rate', type=float, default=0.01, help='learning rate')
     parser.add_argument('--lr_decay_epochs', type=str, default='150,180,210', help='where to decay lr, can be a list')
     parser.add_argument('--lr_decay_rate', type=float, default=0.1, help='decay rate for learning rate')
     parser.add_argument('--weight_decay', type=float, default=5e-4, help='weight decay')
     parser.add_argument('--momentum', type=float, default=0.9, help='momentum')
 
     # dataset
-    parser.add_argument('--dataset', type=str, default='cifar100', choices=['cifar100'], help='dataset')
+    parser.add_argument('--dataset', type=str, default='cifar100', choices=['cifar100', 'imagenet'], help='dataset')
 
     # model
     parser.add_argument('--model_s', type=str, default='resnet8',
@@ -99,6 +105,10 @@ def parse_option():
 
     opt = parser.parse_args()
 
+    # set training gpu
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
+    os.environ["CUDA_VISIBLE_DEVICES"] = opt.gpu
+
     # set different learning rate from these 4 models
     if opt.model_s in ['MobileNetV2', 'ShuffleV1', 'ShuffleV2']:
         opt.learning_rate = 0.01
@@ -116,11 +126,14 @@ def parse_option():
     for it in iterations:
         opt.lr_decay_epochs.append(int(it))
 
-    opt.model_t = get_teacher_name(opt.path_t)
+    if 'pretrained_torch' not in opt.path_t:
+        opt.model_t = get_teacher_name(opt.path_t)
+    else:
+        opt.model_t = opt.path_t.split('/')[1]
 
     
-    opt.model_name = 'S:{}_T:{}_{}_{}_r:{}_a:{}_b:{}_{}_ts:{}_strat:{}_lr:{}'.format(opt.model_t, opt.model_t, opt.dataset, opt.distill,
-                                                                opt.gamma, opt.alpha, opt.beta, opt.trial, opt.target_sparsity, opt.strat, opt.learning_rate)
+    opt.model_name = 'S:{}_T:{}_{}_{}_r:{}_a:{}_b:{}_{}_ts:{}_strat:{}_lr:{}_epochs:{}'.format(opt.model_t, opt.model_t, opt.dataset, opt.distill,
+                                                                opt.gamma, opt.alpha, opt.beta, opt.trial, opt.target_sparsity, opt.strat, opt.learning_rate, opt.epochs)
     
     if opt.bias:
         opt.model_name += ":bias"
@@ -144,12 +157,24 @@ def get_teacher_name(model_path):
     else:
         return segments[0] + '_' + segments[1] + '_' + segments[2]
 
+def get_pretrained_torch_model(model_name, num_classes):
+    if model_name == 'resnet34':
+        model = models.resnet34(pretrained=True)
+    else:
+        raise NotImplementedError(model_name + ' not implemented')
+    return model
 
 def load_teacher(model_path, n_cls):
     print('==> loading teacher model')
-    model_t = get_teacher_name(model_path)
-    model = model_dict[model_t](num_classes=n_cls)
-    model.load_state_dict(torch.load(model_path)['model'])
+    if 'pretrained_torch' in model_path:
+        model_t = model_path.split('/')[-1]
+        model = get_pretrained_torch_model(model_t, n_cls)
+        model = Teacher(model) 
+        return model
+    else:
+        model_t = get_teacher_name(model_path)
+        model = model_dict[model_t](num_classes=n_cls)
+        model.load_state_dict(torch.load(model_path)['model'])
     print('==> done')
     return model
 
@@ -193,6 +218,11 @@ def main():
                                                                is_instance=True)
             
         n_cls = 100
+    elif opt.dataset == 'imagenet':
+        train_loader, val_loader, n_data = get_imagenet_dataloader(batch_size=opt.batch_size,
+                                                                        num_workers=opt.num_workers,
+                                                                        is_instance=True)
+        n_cls = 1000
     else:
         raise NotImplementedError(opt.dataset)
 
@@ -201,11 +231,19 @@ def main():
     #model_s = model_dict[opt.model_s](num_classes=n_cls)
     model_s = load_teacher(opt.path_t, n_cls)
 
-    data = torch.randn(2, 3, 32, 32)
+    
+
     model_t.eval()
     model_s.eval()
-    feat_t, _ = model_t(data, is_feat=True)
-    feat_s, _ = model_s(data, is_feat=True)
+
+    if 'pretrained_torch' not in opt.path_t:
+        data = torch.randn(2, 3, 32, 32)
+        feat_t, _ = model_t(data, is_feat=True)
+        feat_s, _ = model_s(data, is_feat=True)
+    else:
+        data = torch.randn(2, 3, 200, 200)
+        feat_t, _ = model_t(data)
+        feat_s, _ = model_s(data)
 
     module_list = nn.ModuleList([])
     module_list.append(model_s)
@@ -325,21 +363,23 @@ def main():
 
 
 
-    freq = 5
-    prune_end = opt.epochs // 2
-    prune_sch = AgpPruningRate(.1, opt.target_sparsity, 1, prune_end, freq)
+    freq = 1
+    prune_end = int(opt.epochs * 0.75)
+    prune_sch = AgpPruningRate(.05, opt.target_sparsity, 1, prune_end, freq)
     prune_layers = [module for module in module_list[0].modules()][:-1]
 
     #prune_layers = module_list[0].get_feat_modules()
 
     strat = opt.strat
      # routine
+    #print(prune_layers)
     for epoch in range(1, opt.epochs + 1):
 
         adjust_learning_rate(epoch, opt, optimizer)
 
         if epoch % freq == 1 and epoch <= prune_end:
             target = prune_sch.step(epoch)
+            print(target)
             print(f'pruning {target * 100}% sparsity')
             if epoch > 1 and epoch < prune_end:
                for i, layer in enumerate(prune_layers):
@@ -355,7 +395,7 @@ def main():
                                               amount=float(target))
                     layer_spar = float(torch.sum(layer.weight == 0))
                     layer_spar /= float(layer.weight.nelement())
-                    print(f"Sparsity in layer {i}: {layer_spar: 3f}")
+                    print(f"Sparsity in layer {i} {type(layer)} {layer_spar: 3f}")
         elif epoch > prune_end:
             print("All done pruning")
 
@@ -375,7 +415,7 @@ def main():
         logger.log_value('test_loss', test_loss, epoch)
         logger.log_value('test_acc_top5', tect_acc_top5, epoch)
 
-        # save the best model
+        #save the best model
         if test_acc > best_acc and epoch > prune_end:
             best_acc = test_acc
             state = {
@@ -387,13 +427,13 @@ def main():
             print('saving the best model!')
             torch.save(state, save_file)
 
-        # regular saving
+        #regular saving
         if epoch % opt.save_freq == 0:
             print('==> Saving...')
             state = {
                 'epoch': epoch,
                 'model': model_s.state_dict(),
-                'accuracy': test_acc,
+                # 'accuracy': test_acc,
             }
             save_file = os.path.join(opt.save_folder, 'ckpt_epoch_{epoch}.pth'.format(epoch=epoch))
             torch.save(state, save_file)

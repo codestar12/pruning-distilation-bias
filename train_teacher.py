@@ -1,6 +1,8 @@
 from __future__ import print_function
 
 import os
+os.environ['KMP_WARNINGS'] = 'off'
+import sys
 import argparse
 import socket
 import time
@@ -11,9 +13,12 @@ import torch.optim as optim
 import torch.nn as nn
 import torch.backends.cudnn as cudnn
 
+import torchvision.models as models
+
 from models import model_dict
 
 from dataset.cifar100 import get_cifar100_dataloaders, get_cifar100_imbalanced
+from dataset.imagenet import get_imagenet_dataloader
 
 from helper.util import adjust_learning_rate, accuracy, AverageMeter
 from helper.loops import train_vanilla as train, validate
@@ -48,6 +53,8 @@ def parse_option():
 
     parser = argparse.ArgumentParser('argument for training')
 
+    parser.add_argument('--gpu', type=str, default='0', choices=['0', '1', '2', '3'], help='gpu to train on')
+
     parser.add_argument('--print_freq', type=int, default=100, help='print frequency')
     parser.add_argument('--tb_freq', type=int, default=500, help='tb frequency')
     parser.add_argument('--save_freq', type=int, default=40, help='save frequency')
@@ -67,9 +74,9 @@ def parse_option():
                         choices=['resnet8', 'resnet14', 'resnet20', 'resnet32', 'resnet44', 'resnet56', 'resnet110',
                                  'resnet8x4', 'resnet32x4', 'wrn_16_1', 'wrn_16_2', 'wrn_40_1', 'wrn_40_2',
                                  'vgg8', 'vgg11', 'vgg13', 'vgg16', 'vgg19',
-                                 'MobileNetV2', 'ShuffleV1', 'ShuffleV2', ])
-    parser.add_argument('--dataset', type=str, default='cifar100', choices=['cifar100'], help='dataset')
-    parser.add_argument("--target_sparsity", default=None, type=float, choices=[0.30, 0.45, 0.60, 0.75, 0.90])
+                                 'MobileNetV2', 'ShuffleV1', 'ShuffleV2', 'pretrained_torch/resnet34'])
+    parser.add_argument('--dataset', type=str, default='cifar100', choices=['cifar100', 'imagenet'], help='dataset')
+    parser.add_argument("--target_sparsity", default=0.45, type=float, choices=[0.30, 0.45, 0.60, 0.75, 0.90])
     parser.add_argument("--strat", default="struct", type=str, choices=["struct", "finegrain"])
     parser.add_argument("--bias", default=False, type=bool, choices=[True, False])
     parser.add_argument('--path_t', type=str, default=None, help='teacher model snapshot')
@@ -77,6 +84,10 @@ def parse_option():
     parser.add_argument('-t', '--trial', type=int, default=0, help='the experiment id')
 
     opt = parser.parse_args()
+
+    # set training gpu
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"   # see issue #152
+    os.environ["CUDA_VISIBLE_DEVICES"] = opt.gpu
     
     # set different learning rate from these 4 models
     if opt.model in ['MobileNetV2', 'ShuffleV1', 'ShuffleV2']:
@@ -116,7 +127,11 @@ def parse_option():
 
     return opt
 
-
+def get_pretrained_torch_model(model_name, num_classes):
+    if model_name == 'resnet34':
+        model = models.resnet34(pretrained=True)
+    return model
+    
 def main():
     best_acc = 0
 
@@ -147,15 +162,23 @@ def main():
                                                                num_workers=opt.num_workers)
             
         n_cls = 100
+    elif opt.dataset == 'imagenet':
+        train_loader, val_loader = get_imagenet_dataloader(batch_size=opt.batch_size, num_workers=opt.num_workers)
+        n_cls = 1000
     else:
         raise NotImplementedError(opt.dataset)
 
     # model
-    model = model_dict[opt.model](num_classes=n_cls)
+    if 'pretrained_torch' not in opt.model:
+        model = model_dict[opt.model](num_classes=n_cls)
+    else:
+        model_name = opt.model.split('/')[1]
+        model = get_pretrained_torch_model(model_name, n_cls)
     
     if opt.path_t:
         model = load_teacher(opt.path_t, n_cls)
-
+    elif 'pretrained_torch' in opt.model:
+        opt.path_t = 'pretrained_torch'
     # optimizer
     optimizer = optim.SGD(model.parameters(),
                           lr=opt.learning_rate,
@@ -173,9 +196,9 @@ def main():
     logger = tb_logger.Logger(logdir=opt.tb_folder, flush_secs=2)
 
     # routine
-    freq = 5
-    prune_end = opt.epochs // 2
-    prune_sch = AgpPruningRate(.1, opt.target_sparsity, 1, prune_end, freq)
+    freq = 1
+    prune_end = int(opt.epochs * 0.75)
+    prune_sch = AgpPruningRate(.05, opt.target_sparsity, 1, prune_end, freq)
     prune_layers = [module for module in model.modules()][:-1]
     strat = opt.strat
     for epoch in range(1, opt.epochs + 1):
@@ -256,7 +279,6 @@ def main():
     }
     save_file = os.path.join(opt.save_folder, '{}_last.pth'.format(opt.model))
     torch.save(state, save_file)
-
 
 if __name__ == '__main__':
     main()
